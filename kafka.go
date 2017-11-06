@@ -1,17 +1,23 @@
 package kafka
 
 import (
-	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"strconv"
 	"strings"
-	"text/template"
 	"time"
-
 	"github.com/gliderlabs/logspout/router"
 	"gopkg.in/Shopify/sarama.v1"
+)
+
+
+const (
+	NO_MESSAGE_PROVIDED     = "no message"
+	LOGTYPE_APPLICATIONLOG  = "applog"
+	LOGTYPE_ACCESSLOG       = "accesslog"
 )
 
 func init() {
@@ -23,7 +29,46 @@ type KafkaAdapter struct {
 	brokers  []string
 	topic    string
 	producer sarama.AsyncProducer
-	tmpl     *template.Template
+	docker_host   string
+	use_v0        bool
+	logstash_type string
+	dedot_labels  bool
+	msg_counter   int
+}
+
+type DockerFields struct {
+	Name       string            `json:"name"`
+	CID        string            `json:"cid"`
+	Image      string            `json:"image"`
+	ImageTag   string            `json:"image_tag,omitempty"`
+	Source     string            `json:"source"`
+	DockerHost string            `json:"docker_host,omitempty"`
+	Labels     map[string]string `json:"labels,omitempty"`
+}
+
+type LogstashFields struct {
+	Docker DockerFields `json:"docker"`
+}
+
+type LogstashMessageV0 struct {
+	Type       string         `json:"@type,omitempty"`
+	Timestamp  string         `json:"@timestamp"`
+	Sourcehost string         `json:"@source_host"`
+	Message    string         `json:"@message"`
+	Fields     LogstashFields `json:"@fields"`
+}
+
+type LogstashMessageV1 struct {
+	Type       string       `json:"@type,omitempty"`
+	Timestamp  string       `json:"@timestamp"`
+	Sourcehost string       `json:"host"`
+	Message    string       `json:"message"`
+	Fields     DockerFields `json:"docker"`
+	Logtype    string       `json:"logtype,omitempty"`
+	// Only one of the following 3 is initialized and used, depending on the incoming json:logtype
+	LogtypeAccessfields map[string]interface{} `json:"accesslog,omitempty"`
+	LogtypeAppfields    map[string]interface{} `json:"applog,omitempty"`
+	LogtypeEventfields  map[string]interface{} `json:"event,omitempty"`
 }
 
 func NewKafkaAdapter(route *router.Route) (router.LogAdapter, error) {
@@ -38,13 +83,6 @@ func NewKafkaAdapter(route *router.Route) (router.LogAdapter, error) {
 	}
 
 	var err error
-	var tmpl *template.Template
-	if text := os.Getenv("KAFKA_TEMPLATE"); text != "" {
-		tmpl, err = template.New("kafka").Parse(text)
-		if err != nil {
-			return nil, errorf("Couldn't parse Kafka message template. %v", err)
-		}
-	}
 
 	if os.Getenv("DEBUG") != "" {
 		log.Printf("Starting Kafka producer for address: %s, topic: %s.\n", brokers, topic)
@@ -75,14 +113,18 @@ func NewKafkaAdapter(route *router.Route) (router.LogAdapter, error) {
 		brokers:  brokers,
 		topic:    topic,
 		producer: producer,
-		tmpl:     tmpl,
 	}, nil
 }
 
 func (a *KafkaAdapter) Stream(logstream chan *router.Message) {
 	defer a.producer.Close()
+
+
 	for rm := range logstream {
-		message, err := a.formatMessage(rm)
+
+		a.msg_counter += 1
+
+		message, err := createLogstashMessage(rm, a.topic, a.docker_host, a.use_v0, a.logstash_type, a.dedot_labels)
 		if err != nil {
 			log.Println("kafka:", err)
 			a.route.Close()
@@ -92,6 +134,8 @@ func (a *KafkaAdapter) Stream(logstream chan *router.Message) {
 		a.producer.Input() <- message
 	}
 }
+
+
 
 func newConfig() *sarama.Config {
 	config := sarama.NewConfig()
@@ -113,22 +157,133 @@ func newConfig() *sarama.Config {
 	return config
 }
 
-func (a *KafkaAdapter) formatMessage(message *router.Message) (*sarama.ProducerMessage, error) {
-	var encoder sarama.Encoder
-	if a.tmpl != nil {
-		var w bytes.Buffer
-		if err := a.tmpl.Execute(&w, message); err != nil {
-			return nil, err
-		}
-		encoder = sarama.ByteEncoder(w.Bytes())
+func splitImage(image_tag string) (image string, tag string) {
+	colon := strings.LastIndex(image_tag, ":")
+	sep := strings.LastIndex(image_tag, "/")
+	if colon > -1 && sep < colon {
+		image = image_tag[0:colon]
+		tag = image_tag[colon+1:]
 	} else {
-		encoder = sarama.StringEncoder(message.Data)
+		image = image_tag
+	}
+	return
+}
+
+func dedotLabels(labels map[string]string) map[string]string {
+	for key, _ := range labels {
+		if strings.Contains(key, ".") {
+			dedotted_label := strings.Replace(key, ".", "_", -1)
+			labels[dedotted_label] = labels[key]
+			delete(labels, key)
+		}
 	}
 
-	return &sarama.ProducerMessage{
-		Topic: a.topic,
+	return labels
+}
+
+func validJsonMessage(s string) bool {
+
+	if !strings.HasPrefix(s, "{") || !strings.HasSuffix(s, "}") {
+		return false
+	}
+	return true
+}
+
+func createLogstashMessage(m *router.Message, topic string, docker_host string, use_v0 bool, logstash_type string, dedot_labels bool) (*sarama.ProducerMessage, error) {
+	image, image_tag := splitImage(m.Container.Config.Image)
+	cid := m.Container.ID[0:12]
+	name := m.Container.Name[1:]
+	timestamp := m.Time.UTC().Format(time.RFC3339Nano)
+
+		msg := LogstashMessageV1{}
+
+		msg.Type = logstash_type
+		msg.Timestamp = timestamp
+		msg.Sourcehost = m.Container.Config.Hostname
+		msg.Fields.CID = cid
+		msg.Fields.Name = name
+		msg.Fields.Image = image
+		msg.Fields.ImageTag = image_tag
+		msg.Fields.Source = m.Source
+		msg.Fields.DockerHost = docker_host
+
+		// see https://github.com/rtoma/logspout-redis-logstash/issues/11
+		if dedot_labels {
+			msg.Fields.Labels = dedotLabels(m.Container.Config.Labels)
+		} else {
+			msg.Fields.Labels = m.Container.Config.Labels
+		}
+
+		// Check if the message to log itself is json
+		if validJsonMessage(strings.TrimSpace(m.Data)) {
+			// So it is, include it in the LogstashmessageV1
+			err := msg.UnmarshalDynamicJSON([]byte(m.Data))
+			if err != nil {
+				// Can't unmarshall the json (invalid?), put it in message
+				msg.Message = m.Data
+			} else if msg.Message == "" {
+				msg.Message = NO_MESSAGE_PROVIDED
+			}
+		} else {
+			// Regular logging (no json)
+			msg.Message = m.Data
+		}
+
+		var encoder sarama.Encoder
+		jsonMessage,_ := json.Marshal(msg)
+		encoder = sarama.ByteEncoder(jsonMessage)
+
+		return &sarama.ProducerMessage{
+		Topic: topic,
 		Value: encoder,
-	}, nil
+		}, nil
+}
+
+func (d *LogstashMessageV1) UnmarshalDynamicJSON(data []byte) error {
+	var dynMap map[string]interface{}
+
+	if d == nil {
+		return errors.New("RawString: UnmarshalJSON on nil pointer")
+	}
+
+	if err := json.Unmarshal(data, &dynMap); err != nil {
+		return err
+	}
+
+	// Take logtype of the hash, but only if it is a valid logtype
+	if _, ok := dynMap["logtype"].(string); ok {
+		if dynMap["logtype"].(string) == LOGTYPE_APPLICATIONLOG || dynMap["logtype"].(string) == LOGTYPE_ACCESSLOG {
+			d.Logtype = dynMap["logtype"].(string)
+			delete(dynMap, "logtype")
+		}
+	}
+	// Take message out of the hash
+	if _, ok := dynMap["message"]; ok {
+		d.Message = dynMap["message"].(string)
+		delete(dynMap, "message")
+	}
+
+	// Only initialize the "used" hash in struct
+	if d.Logtype == LOGTYPE_APPLICATIONLOG {
+		d.LogtypeAppfields = make(map[string]interface{}, 0)
+	} else if d.Logtype == LOGTYPE_ACCESSLOG {
+		d.LogtypeAccessfields = make(map[string]interface{}, 0)
+	} else {
+		d.LogtypeEventfields = make(map[string]interface{}, 0)
+	}
+
+	// Fill the right hash based on logtype
+	for key, val := range dynMap {
+		if d.Logtype == LOGTYPE_APPLICATIONLOG {
+			d.LogtypeAppfields[key] = val
+		} else if d.Logtype == LOGTYPE_ACCESSLOG {
+			d.LogtypeAccessfields[key] = val
+		} else {
+			d.LogtypeEventfields[key] = val
+		}
+	}
+
+	return nil
 }
 
 func readBrokers(address string) []string {
