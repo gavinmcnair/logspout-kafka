@@ -14,21 +14,31 @@ curl http://container-host:8000/routes -d '{
 }'
 ```
 
-## message template configuration
+## logstash output
 
-The default behavior is to route the raw message to Kafka.  This adapter provides a mechanism for customizing the template to include additional metadata via the `KAFKA_TEMPLATE` environment variable.  Golang's [text/template](http://golang.org/pkg/text/template/) package is used for templating, where the model available for templating is the [Message struct](https://github.com/gliderlabs/logspout/blob/master/router/types.go).
+This is a modified version of the adapter based on the existing Redis and Kafka adapters. Its designed to output logstash style messages.
 
-The following example `KAFKA_TEMPLATE` configuration appends additional metadata to each log message received:
-```
-KAFKA_TEMPLATE="time=\"{{.Time}}\" container_name=\"{{.Container.Name}}\" source=\"{{.Source}}\" data=\"{{.Data}}\""
+*Example Output*
+
+```json
+{
+	"@timestamp": "2017-11-06T23:39:38.643921569Z",
+	"host": "d23b91da8640",
+	"message": "10.11.12.13 - - [06/Nov/2017:23:39:38 +0000] \"GET /v2/ HTTP/1.1\" 200 2 \"\" \"spray-can/1.3.4\"",
+	"docker": {
+		"name": "mesos-d37bc567-c206-4697-b703-08fe74855621-S7.555e8afc-1eaa-4372-896f-378b4abb7dcc",
+		"cid": "d23b91da8640",
+		"image": "registry",
+		"image_tag": "2",
+		"source": "stdout",
+		"labels": {
+			"MESOS_TASK_ID": "docker-registry-balanced.cb184fd5-8690-11e7-af49-520b0a5ccc33"
+		}
+	}
+}
 ```
 
-Example input and output
-```
-Hello World
 
-time="2015-06-23 09:54:55.241951004 +0000 UTC" container_name="/hello_container" source="stdout" data="Hello World"
-```
 
 ## route configuration
 
