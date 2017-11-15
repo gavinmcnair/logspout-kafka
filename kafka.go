@@ -108,11 +108,14 @@ func NewKafkaAdapter(route *router.Route) (router.LogAdapter, error) {
 		}
 	}
 
+	dedot_labels := getopt(route.Options, "dedot_labels", "DEDOT_LABELS", "false") == "true"
+
 	return &KafkaAdapter{
-		route:    route,
-		brokers:  brokers,
-		topic:    topic,
-		producer: producer,
+		route:        route,
+		brokers:      brokers,
+		topic:        topic,
+		producer:     producer,
+		dedot_labels: dedot_labels
 	}, nil
 }
 
