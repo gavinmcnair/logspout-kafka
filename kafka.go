@@ -115,7 +115,7 @@ func NewKafkaAdapter(route *router.Route) (router.LogAdapter, error) {
 		brokers:      brokers,
 		topic:        topic,
 		producer:     producer,
-		dedot_labels: dedot_labels
+		dedot_labels: dedot_labels,
 	}, nil
 }
 
@@ -314,6 +314,17 @@ func errorf(format string, a ...interface{}) (err error) {
 	err = fmt.Errorf(format, a...)
 	if os.Getenv("DEBUG") != "" {
 		fmt.Println(err.Error())
+	}
+	return
+}
+
+func getopt(options map[string]string, optkey string, envkey string, default_value string) (value string) {
+	value = options[optkey]
+	if value == "" {
+		value = os.Getenv(envkey)
+		if value == "" {
+			value = default_value
+		}
 	}
 	return
 }
